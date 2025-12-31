@@ -30,6 +30,11 @@ impl MmapFile {
         Ok(MmapFile { path, file, mmap, len })
     }
 
+    /// Get an immutable view of the mapping.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap.as_ref().expect("mapping present")[..]
+    }
+
     /// Get a mutable view of the mapping.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.mmap.as_mut().expect("mapping present")[..]

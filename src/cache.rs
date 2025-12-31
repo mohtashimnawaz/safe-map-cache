@@ -148,7 +148,7 @@ impl SafeMmapCache {
             }
         } else {
             // evict LRU
-            let (old_key, old_slot) = guard.lru.pop_lru().ok_or(CacheError::InsufficientSpace)?;
+            let (_old_key, old_slot) = guard.lru.pop_lru().ok_or(CacheError::InsufficientSpace)?;
             // invalidate old slot
             let mut old = guard.read_index_slot(old_slot)?;
             old.flags = 0;
@@ -207,27 +207,31 @@ impl SafeMmapCache {
 // --- Inner helpers ---
 impl Inner {
     fn init_and_load_index(&mut self) -> Result<(), io::Error> {
-        let buf = self.mmap.as_mut_slice();
         // ensure header
-        if buf.len() < HEADER_SIZE {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file too small"));
-        }
-        if &buf[0..8] != HEADER_MAGIC {
-            // initialize header
-            buf[0..8].copy_from_slice(HEADER_MAGIC);
-            buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // version
-            buf[12..16].copy_from_slice(&(self.index_capacity as u32).to_le_bytes());
-            // zero index region
-            let idx_len = self.index_capacity * RECORD_SIZE;
-            let start = HEADER_SIZE;
-            for b in &mut buf[start..start + idx_len] {
-                *b = 0;
+        {
+            let buf = self.mmap.as_mut_slice();
+            if buf.len() < HEADER_SIZE {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file too small"));
             }
-            self.mmap.flush()?;
+            if &buf[0..8] != HEADER_MAGIC {
+                // initialize header
+                buf[0..8].copy_from_slice(HEADER_MAGIC);
+                buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // version
+                buf[12..16].copy_from_slice(&(self.index_capacity as u32).to_le_bytes());
+                // zero index region
+                let idx_len = self.index_capacity * RECORD_SIZE;
+                let start = HEADER_SIZE;
+                for b in &mut buf[start..start + idx_len] {
+                    *b = 0;
+                }
+                // `buf` goes out of scope here, releasing the mutable borrow
+                self.mmap.flush()?;
+            }
         }
 
-        // load index
+        // load index (use immutable borrow for reads)
         self.next_data_offset = self.data_start;
+        let buf = self.mmap.as_slice();
         for i in 0..self.index_capacity {
             let start = HEADER_SIZE + i * RECORD_SIZE;
             let rec = IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]);
@@ -246,9 +250,12 @@ impl Inner {
     }
 
     fn read_index_slot(&self, slot: usize) -> Result<IndexRecord, io::Error> {
-        let buf = self.mmap.as_mut_slice();
+        // read without holding mutable borrow on mmap
+        let buf = self.mmap.as_slice();
         let start = HEADER_SIZE + slot * RECORD_SIZE;
-        Ok(IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]))
+        let mut tmp = [0u8; RECORD_SIZE];
+        tmp.copy_from_slice(&buf[start..start + RECORD_SIZE]);
+        Ok(IndexRecord::from_bytes(&tmp))
     }
 
     fn write_index_slot(&mut self, slot: usize, rec: IndexRecord) -> Result<(), io::Error> {
