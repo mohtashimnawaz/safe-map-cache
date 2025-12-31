@@ -6,7 +6,7 @@ use safe_map_cache::{Config, SafeMmapCache};
 
 fn bench_mmap_put_get(c: &mut Criterion) {
     let tmp = NamedTempFile::new().expect("temp file");
-    let cfg = Config { path: tmp.path().to_path_buf(), slot_size: 256, capacity: 1024 };
+    let cfg = Config { path: tmp.path().to_path_buf(), index_capacity: 1024, initial_file_size: 4 * 1024 * 1024 };
     let cache = SafeMmapCache::open(cfg).expect("open");
 
     c.bench_function("mmap_put", |b| {

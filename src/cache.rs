@@ -4,6 +4,10 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use thiserror::Error;
 
+const HEADER_MAGIC: &[u8; 8] = b"SMAPCACH";
+const HEADER_SIZE: usize = 16; // magic (8) + version (4) + capacity (4)
+const RECORD_SIZE: usize = 32; // key(8) offset(8) len(8) flags(8)
+
 #[derive(Error, Debug)]
 pub enum CacheError {
     #[error("io: {0}")]
@@ -17,26 +21,52 @@ pub enum CacheError {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub path: PathBuf,
-    /// size of each fixed slot (bytes)
-    pub slot_size: usize,
-    /// number of slots in the file
-    pub capacity: usize,
+    /// number of index entries
+    pub index_capacity: usize,
+    /// initial file size in bytes
+    pub initial_file_size: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexRecord {
+    key: u64,
+    offset: u64,
+    len: u64,
+    flags: u64,
+}
+
+impl IndexRecord {
+    fn from_bytes(b: &[u8]) -> Self {
+        let key = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let len = u64::from_le_bytes(b[16..24].try_into().unwrap());
+        let flags = u64::from_le_bytes(b[24..32].try_into().unwrap());
+        IndexRecord { key, offset, len, flags }
+    }
+
+    fn to_bytes(&self, b: &mut [u8]) {
+        b[0..8].copy_from_slice(&self.key.to_le_bytes());
+        b[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        b[16..24].copy_from_slice(&self.len.to_le_bytes());
+        b[24..32].copy_from_slice(&self.flags.to_le_bytes());
+    }
 }
 
 struct Inner {
-    // mmap backing store
     mmap: crate::mmap::MmapFile,
-    // LRU index: key -> slot_index
-    lru: LruCache<u64, usize>,
-    // free slot stack
+    lru: LruCache<u64, usize>, // key -> index_slot
     free_slots: Vec<usize>,
-    slot_size: usize,
+    index_capacity: usize,
+    data_start: usize,
+    next_data_offset: usize,
 }
 
-/// A safe, concurrent, memory-mapped LRU cache.
+/// A safe, concurrent, memory-mapped LRU cache with a persisted index.
 ///
-/// This implementation uses a fixed-size slot allocator (simple, safe)
-/// where each slot stores a u64 length header followed by the payload.
+/// This implementation stores an index in the first region of the file that is
+/// rebuilt on open. Values are variable-sized blobs appended into the data
+/// section; evicted entries free their index slot for reuse (data is not
+/// reclaimed yet).
 pub struct SafeMmapCache {
     inner: Arc<RwLock<Inner>>,
 }
@@ -44,29 +74,20 @@ pub struct SafeMmapCache {
 impl SafeMmapCache {
     /// Open or create a cache file according to `cfg`.
     pub fn open(cfg: Config) -> Result<Self, CacheError> {
-        let file_size = cfg.slot_size.checked_mul(cfg.capacity).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "slot_size * capacity overflow")
-        })?;
+        let initial = cfg.initial_file_size.max(HEADER_SIZE + RECORD_SIZE * cfg.index_capacity + 1024);
+        let mmap = crate::mmap::MmapFile::open(cfg.path, initial)?;
 
-        if cfg.capacity == 0 {
-            return Err(CacheError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "capacity must be > 0",
-            )));
-        }
-
-        let mmap = crate::mmap::MmapFile::open(cfg.path, file_size)?;
-
-        let free_slots = (0..cfg.capacity).rev().collect();
-
-        let cap_nz = std::num::NonZeroUsize::new(cfg.capacity).unwrap();
-
-        let inner = Inner {
+        let mut inner = Inner {
             mmap,
-            lru: LruCache::new(cap_nz),
-            free_slots,
-            slot_size: cfg.slot_size,
+            lru: LruCache::new(std::num::NonZeroUsize::new(cfg.index_capacity).unwrap()),
+            free_slots: Vec::new(),
+            index_capacity: cfg.index_capacity,
+            data_start: HEADER_SIZE + cfg.index_capacity * RECORD_SIZE,
+            next_data_offset: 0,
         };
+
+        // initialize header if needed and read index
+        inner.init_and_load_index()?;
 
         Ok(SafeMmapCache {
             inner: Arc::new(RwLock::new(inner)),
@@ -76,29 +97,18 @@ impl SafeMmapCache {
     /// Get a value by key.
     pub fn get(&self, key: u64) -> Result<Option<Vec<u8>>, CacheError> {
         let mut guard = self.inner.write();
-        if let Some(slot_idx) = guard.lru.get(&key).cloned() {
-            // slot base offset
-            let slot_size = guard.slot_size;
-            let base = slot_idx * slot_size;
-            let buf = guard.mmap.as_mut_slice();
-            if base + 8 > buf.len() {
-                return Err(CacheError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "corrupt slot header",
-                )));
-            }
-            let len = u64::from_le_bytes(buf[base..base + 8].try_into().unwrap()) as usize;
-            if len == 0 {
+        if let Some(slot) = guard.lru.get(&key).cloned() {
+            let rec = guard.read_index_slot(slot)?;
+            if rec.flags == 0 {
                 return Ok(None);
             }
-            if base + 8 + len > buf.len() || len > slot_size - 8 {
-                return Err(CacheError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "corrupt slot length",
-                )));
+            let offset = rec.offset as usize;
+            let len = rec.len as usize;
+            let buf = guard.mmap.as_mut_slice();
+            if offset + len > buf.len() {
+                return Err(CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data")));
             }
-            let data = buf[base + 8..base + 8 + len].to_vec();
-            // `get` already promoted recency inside LruCache
+            let data = buf[offset..offset + len].to_vec();
             return Ok(Some(data));
         }
         Ok(None)
@@ -107,57 +117,80 @@ impl SafeMmapCache {
     /// Put a key/value pair into the cache.
     pub fn put(&self, key: u64, value: &[u8]) -> Result<(), CacheError> {
         let mut guard = self.inner.write();
-        if value.len() > guard.slot_size - 8 {
-            return Err(CacheError::InsufficientSpace);
-        }
-
-        // If already present, overwrite the slot
-        if let Some(slot_idx) = guard.lru.get(&key).cloned() {
-            let base = slot_idx * guard.slot_size;
-            let buf = guard.mmap.as_mut_slice();
-            buf[base..base + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());
-            buf[base + 8..base + 8 + value.len()].copy_from_slice(value);
-            guard.lru.put(key, slot_idx); // refresh recency
-            return Ok(());
-        }
-
-        // allocate a slot
-        let slot_idx = if let Some(s) = guard.free_slots.pop() {
-            s
-        } else {
-            // evict least recently used
-            if let Some((_old_key, old_slot)) = guard.lru.pop_lru() {
-                // reuse slot
-                old_slot
-            } else {
-                return Err(CacheError::InsufficientSpace);
+        // if exists and fits, overwrite in place
+        if let Some(slot) = guard.lru.get(&key).cloned() {
+            let rec = guard.read_index_slot(slot)?;
+            if rec.flags != 0 && (value.len() as u64) <= rec.len {
+                let offset = rec.offset as usize;
+                let buf = guard.mmap.as_mut_slice();
+                buf[offset..offset + value.len()].copy_from_slice(value);
+                // update length if changed
+                let mut new_rec = rec;
+                new_rec.len = value.len() as u64;
+                guard.write_index_slot(slot, new_rec)?;
+                guard.lru.put(key, slot);
+                return Ok(());
             }
+        }
+
+        // find a free index slot
+        let slot = if let Some(s) = guard.free_slots.pop() {
+            s
+        } else if guard.lru.len() < guard.index_capacity {
+            // find first empty slot
+            let mut s = 0usize;
+            loop {
+                let rec = guard.read_index_slot(s)?;
+                if rec.flags == 0 {
+                    break s;
+                }
+                s += 1;
+            }
+        } else {
+            // evict LRU
+            let (old_key, old_slot) = guard.lru.pop_lru().ok_or(CacheError::InsufficientSpace)?;
+            // invalidate old slot
+            let mut old = guard.read_index_slot(old_slot)?;
+            old.flags = 0;
+            guard.write_index_slot(old_slot, old)?;
+            old_slot
         };
 
-        // write to slot
-        let base = slot_idx * guard.slot_size;
+        // allocate data at end
+        let needed = value.len();
+        let mut offset = guard.next_data_offset;
+        if offset + needed > guard.mmap.len() {
+            // grow file
+            let grow_to = (guard.mmap.len().max(offset + needed) + 4095) & !4095usize;
+            guard.mmap.resize(grow_to)?;
+        }
+        // write data
         let buf = guard.mmap.as_mut_slice();
-        buf[base..base + 8].copy_from_slice(&(value.len() as u64).to_le_bytes());
-        buf[base + 8..base + 8 + value.len()].copy_from_slice(value);
+        let write_offset = offset;
+        buf[write_offset..write_offset + needed].copy_from_slice(value);
+        guard.next_data_offset = write_offset + needed;
 
-        guard.lru.put(key, slot_idx);
+        let new_rec = IndexRecord { key, offset: write_offset as u64, len: needed as u64, flags: 1 };
+        guard.write_index_slot(slot, new_rec)?;
+        guard.lru.put(key, slot);
+
         Ok(())
     }
 
     /// Remove a key from the cache, returning its value if present.
     pub fn remove(&self, key: u64) -> Result<Option<Vec<u8>>, CacheError> {
         let mut guard = self.inner.write();
-        if let Some(slot_idx) = guard.lru.pop(&key) {
-            let base = slot_idx * guard.slot_size;
-            let buf = guard.mmap.as_mut_slice();
-            let len = u64::from_le_bytes(buf[base..base + 8].try_into().unwrap()) as usize;
-            let data = if len == 0 {
-                None
-            } else {
-                Some(buf[base + 8..base + 8 + len].to_vec())
+        if let Some(slot) = guard.lru.pop(&key) {
+            let rec = guard.read_index_slot(slot)?;
+            let data = if rec.flags == 0 { None } else {
+                let buf = guard.mmap.as_mut_slice();
+                Some(buf[rec.offset as usize..rec.offset as usize + rec.len as usize].to_vec())
             };
-            // mark slot free
-            guard.free_slots.push(slot_idx);
+            // invalidate index slot and mark free
+            let mut inv = rec;
+            inv.flags = 0;
+            guard.write_index_slot(slot, inv)?;
+            guard.free_slots.push(slot);
             return Ok(data);
         }
         Ok(None)
@@ -167,6 +200,63 @@ impl SafeMmapCache {
     pub fn flush(&self) -> Result<(), CacheError> {
         let guard = self.inner.read();
         guard.mmap.flush()?;
+        Ok(())
+    }
+}
+
+// --- Inner helpers ---
+impl Inner {
+    fn init_and_load_index(&mut self) -> Result<(), io::Error> {
+        let buf = self.mmap.as_mut_slice();
+        // ensure header
+        if buf.len() < HEADER_SIZE {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file too small"));
+        }
+        if &buf[0..8] != HEADER_MAGIC {
+            // initialize header
+            buf[0..8].copy_from_slice(HEADER_MAGIC);
+            buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // version
+            buf[12..16].copy_from_slice(&(self.index_capacity as u32).to_le_bytes());
+            // zero index region
+            let idx_len = self.index_capacity * RECORD_SIZE;
+            let start = HEADER_SIZE;
+            for b in &mut buf[start..start + idx_len] {
+                *b = 0;
+            }
+            self.mmap.flush()?;
+        }
+
+        // load index
+        self.next_data_offset = self.data_start;
+        for i in 0..self.index_capacity {
+            let start = HEADER_SIZE + i * RECORD_SIZE;
+            let rec = IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]);
+            if rec.flags != 0 {
+                // valid
+                self.lru.put(rec.key, i);
+                let end = rec.offset as usize + rec.len as usize;
+                if end > self.next_data_offset {
+                    self.next_data_offset = end;
+                }
+            } else {
+                self.free_slots.push(i);
+            }
+        }
+        Ok(())
+    }
+
+    fn read_index_slot(&self, slot: usize) -> Result<IndexRecord, io::Error> {
+        let buf = self.mmap.as_mut_slice();
+        let start = HEADER_SIZE + slot * RECORD_SIZE;
+        Ok(IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]))
+    }
+
+    fn write_index_slot(&mut self, slot: usize, rec: IndexRecord) -> Result<(), io::Error> {
+        let buf = self.mmap.as_mut_slice();
+        let start = HEADER_SIZE + slot * RECORD_SIZE;
+        rec.to_bytes(&mut buf[start..start + RECORD_SIZE]);
+        // flush index area to persist update
+        self.mmap.flush()?;
         Ok(())
     }
 }
@@ -181,8 +271,8 @@ mod tests {
         let tmp = NamedTempFile::new().expect("temp file");
         let cfg = Config {
             path: tmp.path().to_path_buf(),
-            slot_size: 256,
-            capacity: 16,
+            index_capacity: 16,
+            initial_file_size: 16 * 1024,
         };
 
         let c = SafeMmapCache::open(cfg).expect("open cache");
@@ -194,8 +284,8 @@ mod tests {
         let tmp = NamedTempFile::new().expect("temp file");
         let cfg = Config {
             path: tmp.path().to_path_buf(),
-            slot_size: 64,
-            capacity: 2,
+            index_capacity: 2,
+            initial_file_size: 4096,
         };
 
         let cache = SafeMmapCache::open(cfg).expect("open");
@@ -229,8 +319,8 @@ mod tests {
         let tmp = NamedTempFile::new().expect("temp file");
         let cfg = Config {
             path: tmp.path().to_path_buf(),
-            slot_size: 256,
-            capacity: 256,
+            index_capacity: 256,
+            initial_file_size: 256 * 1024,
         };
 
         let cache = std::sync::Arc::new(SafeMmapCache::open(cfg).expect("open"));
