@@ -2,6 +2,12 @@
 name = "safe-map-cache"
 version = "0.1.0"
 edition = "2024"
+authors = ["Mohtashim Nawaz"]
+description = "A safe, concurrent memory-mapped LRU cache with a persisted on-disk index and compaction."
+readme = "README.md"
+license = "MIT"
+keywords = ["mmap", "cache", "lru", "mmap-cache"]
+categories = ["database", "caching"]
 
 [dependencies]
 memmap2 = "0.6"
