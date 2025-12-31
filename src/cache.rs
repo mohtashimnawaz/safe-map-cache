@@ -28,6 +28,8 @@ pub struct Config {
     pub free_capacity: usize,
     /// initial file size in bytes
     pub initial_file_size: usize,
+    /// when true, run extra validations after mutating ops (useful for debugging / tests)
+    pub strict_validations: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -71,6 +73,8 @@ struct Inner {
     freelist_start: usize,
     data_start: usize,
     next_data_offset: usize,
+    /// When true, perform extra validation checks (slower, for tests/debug)
+    strict: bool,
 }
 
 /// A safe, concurrent, memory-mapped LRU cache with a persisted index.
@@ -103,6 +107,7 @@ impl SafeMmapCache {
                 + cfg.index_capacity * RECORD_SIZE
                 + cfg.free_capacity * FREE_ENTRY_SIZE,
             next_data_offset: 0,
+            strict: cfg.strict_validations,
         };
 
         // initialize header if needed and read index and free-list
@@ -291,6 +296,10 @@ impl SafeMmapCache {
         guard.write_index_slot(slot, new_rec)?;
         guard.lru.put(key, slot);
 
+        if guard.strict {
+            guard.check_invariants().map_err(CacheError::Io)?;
+        }
+
         Ok(())
     }
 
@@ -330,7 +339,15 @@ impl SafeMmapCache {
             guard.free_slots.push(slot);
 
             // record freed data extent into persistent free-list (if space), coalescing with neighbors
-            guard.insert_free_extent(rec.offset as usize, rec.len as usize)?;
+            // skip zero-length extents (they convey no space)
+            if rec.len != 0 {
+                guard.insert_free_extent(rec.offset as usize, rec.len as usize)?;
+            }
+
+            if guard.strict {
+                guard.check_invariants().map_err(CacheError::Io)?;
+            }
+
             return Ok(data);
         }
         Ok(None)
@@ -347,7 +364,18 @@ impl SafeMmapCache {
     pub fn collect_garbage(&self) -> Result<(), CacheError> {
         let mut guard = self.inner.write();
         guard.collect_garbage()?;
+
+        if guard.strict {
+            guard.check_invariants().map_err(CacheError::Io)?;
+        }
+
         Ok(())
+    }
+
+    /// Run invariant checks (useful in tests)
+    pub fn check_invariants(&self) -> Result<(), CacheError> {
+        let guard = self.inner.read();
+        guard.check_invariants().map_err(CacheError::Io)
     }
 }
 
@@ -514,6 +542,55 @@ impl Inner {
             }
         }
         self.mmap.flush()?;
+        Ok(())
+    }
+
+    /// Run a set of invariant checks and return Err if any fail.
+    fn check_invariants(&self) -> Result<(), io::Error> {
+        // ensure free extents are within file bounds
+        let file_len = self.mmap.as_slice().len();
+        for (off, len, _slot) in &self.free_extents {
+            if *len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "free extent zero length"));
+            }
+            if let Some(end) = off.checked_add(*len) {
+                if end > file_len {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "free extent beyond file"));
+                }
+            } else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "free extent overflow"));
+            }
+        }
+
+        // ensure index records don't overlap each other
+        let mut live_ranges: Vec<(usize, usize)> = Vec::new();
+        for i in 0..self.index_capacity {
+            let rec = match self.read_index_slot(i) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            if rec.flags != 0 {
+                let off = rec.offset as usize;
+                let len = rec.len as usize;
+                let end = off.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record overflow"))?;
+                if end > file_len {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "index record beyond file"));
+                }
+                for (a0, a1) in &live_ranges {
+                    if off < *a1 && *a0 < end {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "overlapping live records"));
+                    }
+                }
+                live_ranges.push((off, end));
+            }
+        }
+
+        // ensure next_data_offset is at least data_start and >= max end
+        let max_end = live_ranges.iter().map(|(_a,b)| *b).max().unwrap_or(self.data_start);
+        if self.next_data_offset < self.data_start || self.next_data_offset < max_end {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "next_data_offset inconsistent"));
+        }
+
         Ok(())
     }
 
@@ -684,6 +761,7 @@ mod tests {
             index_capacity: 16,
             free_capacity: 16,
             initial_file_size: 16 * 1024,
+            strict_validations: false,
         };
 
         let c = SafeMmapCache::open(cfg).expect("open cache");
@@ -698,6 +776,7 @@ mod tests {
             index_capacity: 2,
             free_capacity: 4,
             initial_file_size: 4096,
+            strict_validations: false,
         };
 
         let cache = SafeMmapCache::open(cfg).expect("open");
@@ -734,6 +813,7 @@ mod tests {
             index_capacity: 256,
             free_capacity: 256,
             initial_file_size: 256 * 1024,
+            strict_validations: false,
         };
 
         let cache = std::sync::Arc::new(SafeMmapCache::open(cfg).expect("open"));
@@ -767,6 +847,7 @@ mod tests {
             index_capacity: 8,
             free_capacity: 8,
             initial_file_size: 16 * 1024,
+            strict_validations: false,
         };
 
         let cache = SafeMmapCache::open(cfg).expect("open");

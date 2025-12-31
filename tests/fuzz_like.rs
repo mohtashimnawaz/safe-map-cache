@@ -11,6 +11,7 @@ fn fuzz_like_random_ops() {
         index_capacity: 512,
         free_capacity: 512,
         initial_file_size: 8 * 1024 * 1024,
+        strict_validations: false,
     };
     let cache = SafeMmapCache::open(cfg).expect("open");
 

@@ -19,3 +19,17 @@ If you want to run a more aggressive, native fuzzing workflow using `cargo-fuzz`
 3. Add a fuzz target that imports `safe_map_cache` and invokes sequences of operations.
 
 The included harness is intentionally lightweight so it can be run in CI without special tooling; it caught an index corruption in local testing — further investigation and more intrusive fuzzing (`cargo-fuzz`) is encouraged for deeper coverage.
+
+cargo-fuzz (added)
+------------------
+We added a `fuzz` folder with a `fuzz_ops` target under `fuzz/fuzz_targets/fuzz_ops.rs` that drives randomized put/get/remove sequences.
+
+To run locally:
+
+- Install cargo-fuzz: `cargo install cargo-fuzz`
+- Run the fuzz target: `cargo fuzz run fuzz_ops -- -max_total_time=60`
+
+The GitHub Actions workflow `fuzz.yml` runs a short session (30s) to catch obvious regressions and uploads any artifacts.
+
+Notes:
+- cargo-fuzz is much more thorough if run for long periods and with a persistent corpus; the minimal integration here gives you an easy starting point.

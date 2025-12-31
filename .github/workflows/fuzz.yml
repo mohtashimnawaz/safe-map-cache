@@ -1,0 +1,31 @@
+name: Fuzzing (short runs)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 0' # weekly
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Install cargo-fuzz
+        run: |
+          cargo install cargo-fuzz
+      - name: Run short fuzz session
+        run: |
+          # Run for a limited time (30s) to catch obvious regressions
+          cargo fuzz run fuzz_ops -- -max_total_time=30
+      - name: Upload fuzz corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz/artifacts || true

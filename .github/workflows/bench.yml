@@ -1,6 +1,10 @@
 name: Weekly Benchmarks
 
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   schedule:
     - cron: '0 3 * * 0' # every Sunday at 03:00 UTC
   workflow_dispatch:

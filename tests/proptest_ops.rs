@@ -22,7 +22,7 @@ proptest! {
     #[test]
     fn proptest_sequence(ops in prop::collection::vec(arb_op(), 1..200)) {
         let tmp = NamedTempFile::new().expect("temp file");
-        let cfg = Config { path: tmp.path().to_path_buf(), index_capacity: 256, free_capacity: 256, initial_file_size: 4*1024*1024 };
+        let cfg = Config { path: tmp.path().to_path_buf(), index_capacity: 256, free_capacity: 256, initial_file_size: 4*1024*1024, strict_validations: false };
         let cache = SafeMmapCache::open(cfg).expect("open");
 
         let mut model = HashMap::new();

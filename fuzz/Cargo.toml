@@ -1,0 +1,14 @@
+[package]
+name = "safe_map_cache_fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "fuzz_ops"
+path = "fuzz_targets/fuzz_ops.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+safe-map-cache = { path = ".." }

@@ -10,6 +10,8 @@ fn bench_mmap_put_get(c: &mut Criterion) {
         path: tmp.path().to_path_buf(),
         index_capacity: 1024,
         initial_file_size: 4 * 1024 * 1024,
+        free_capacity: 1024,
+        strict_validations: false,
     };
     let cache = SafeMmapCache::open(cfg).expect("open");
 
