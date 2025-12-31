@@ -109,17 +109,20 @@ impl SafeMmapCache {
     pub fn get(&self, key: u64) -> Result<Option<Vec<u8>>, CacheError> {
         let mut guard = self.inner.write();
         if let Some(slot) = guard.lru.get(&key).cloned() {
-            let rec = guard.read_index_slot(slot)?;
+            // validate and possibly repair the index slot
+            let rec = guard.get_valid_index_slot(slot)?;
             if rec.flags == 0 {
                 return Ok(None);
             }
             let offset = rec.offset as usize;
             let len = rec.len as usize;
             let buf = guard.mmap.as_mut_slice();
-            if offset + len > buf.len() {
-                return Err(CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data")));
+            let end = offset.checked_add(len).ok_or_else(|| CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)")))?;
+            if end > buf.len() {
+                // treat as not found after repair
+                return Ok(None);
             }
-            let data = buf[offset..offset + len].to_vec();
+            let data = buf[offset..end].to_vec();
             return Ok(Some(data));
         }
         Ok(None)
@@ -130,17 +133,25 @@ impl SafeMmapCache {
         let mut guard = self.inner.write();
         // if exists and fits, overwrite in place
         if let Some(slot) = guard.lru.get(&key).cloned() {
-            let rec = guard.read_index_slot(slot)?;
+            let rec = guard.get_valid_index_slot(slot)?;
             if rec.flags != 0 && (value.len() as u64) <= rec.len {
                 let offset = rec.offset as usize;
+                let end = offset.checked_add(value.len()).ok_or_else(|| CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)")))?;
                 let buf = guard.mmap.as_mut_slice();
-                buf[offset..offset + value.len()].copy_from_slice(value);
-                // update length if changed
-                let mut new_rec = rec;
-                new_rec.len = value.len() as u64;
-                guard.write_index_slot(slot, new_rec)?;
-                guard.lru.put(key, slot);
-                return Ok(());
+                if end > buf.len() {
+                    // corrupt slot; clear and fall through to allocate
+                    let mut inv = rec;
+                    inv.flags = 0;
+                    guard.write_index_slot(slot, inv)?;
+                } else {
+                    buf[offset..end].copy_from_slice(value);
+                    // update length if changed
+                    let mut new_rec = rec;
+                    new_rec.len = value.len() as u64;
+                    guard.write_index_slot(slot, new_rec)?;
+                    guard.lru.put(key, slot);
+                    return Ok(());
+                }
             }
         }
 
@@ -169,13 +180,39 @@ impl SafeMmapCache {
 
         // allocate data (try to reuse free extents first)
         let needed = value.len();
-        // select a free extent without mutably borrowing the vector
-        let chosen = guard
+        // collect candidate free extents (length sufficient) without holding an immutable borrow
+        let candidates: Vec<(usize, usize, usize, usize)> = guard
             .free_extents
             .iter()
             .enumerate()
-            .find(|(_i, (_off, len, _slot_idx))| *len >= needed)
-            .map(|(i, (off, len, slot_idx))| (i, *off, *len, *slot_idx));
+            .filter_map(|(i, (off, len, slot_idx))| if *len >= needed { Some((i, *off, *len, *slot_idx)) } else { None })
+            .collect();
+
+        // check each candidate for overlap with live records (we have mutable access to guard)
+        let mut chosen: Option<(usize, usize, usize, usize)> = None;
+        for (i, off, len, slot_idx) in candidates {
+            let mut overlap = false;
+            for idx in 0..guard.index_capacity {
+                let rec = match guard.get_valid_index_slot(idx) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if rec.flags != 0 {
+                    let a0 = rec.offset as usize;
+                    let a1 = match a0.checked_add(rec.len as usize) { Some(v) => v, None => { continue; }};
+                    let b0 = off;
+                    let b1 = match off.checked_add(len) { Some(v) => v, None => { continue; }};
+                    if a0 < b1 && b0 < a1 {
+                        overlap = true;
+                        break;
+                    }
+                }
+            }
+            if !overlap {
+                chosen = Some((i, off, len, slot_idx));
+                break;
+            }
+        }
 
         let write_offset = if let Some((i, off, len, slot_idx)) = chosen {
             // adjust or remove the chosen extent
@@ -183,12 +220,16 @@ impl SafeMmapCache {
                 // consume entire free extent slot
                 // swap_remove to avoid shifting
                 guard.free_extents.swap_remove(i);
-                guard.write_free_slot(slot_idx, None)?;
+                if slot_idx != usize::MAX {
+                    guard.write_free_slot(slot_idx, None)?;
+                }
             } else {
                 // consume from front; adjust extent
                 guard.free_extents[i].0 = off + needed;
                 guard.free_extents[i].1 = len - needed;
-                guard.write_free_slot(slot_idx, Some((off + needed, len - needed)))?;
+                if slot_idx != usize::MAX {
+                    guard.write_free_slot(slot_idx, Some((off + needed, len - needed)))?;
+                }
             }
             off
         } else {
@@ -218,29 +259,32 @@ impl SafeMmapCache {
     pub fn remove(&self, key: u64) -> Result<Option<Vec<u8>>, CacheError> {
         let mut guard = self.inner.write();
         if let Some(slot) = guard.lru.pop(&key) {
-            let rec = guard.read_index_slot(slot)?;
+            let rec = guard.get_valid_index_slot(slot)?;
             let data = if rec.flags == 0 { None } else {
                 let buf = guard.mmap.as_mut_slice();
-                Some(buf[rec.offset as usize..rec.offset as usize + rec.len as usize].to_vec())
+                let offset = rec.offset as usize;
+                let len = rec.len as usize;
+                let end = offset.checked_add(len).ok_or_else(|| CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)")))?;
+                if end > buf.len() {
+                    // already cleaned by get_valid_index_slot, but be defensive
+                    return Ok(None);
+                }
+                Some(buf[offset..end].to_vec())
             };
+            // if slot was already cleared by validation, just mark free and return
+            if rec.flags == 0 {
+                guard.free_slots.push(slot);
+                return Ok(data);
+            }
+
             // invalidate index slot and mark free
             let mut inv = rec;
             inv.flags = 0;
             guard.write_index_slot(slot, inv)?;
             guard.free_slots.push(slot);
 
-            // record freed data extent into persistent free-list (if space)
-            for i in 0..guard.free_capacity {
-                let start = guard.freelist_start + i * FREE_ENTRY_SIZE;
-                let _off = u64::from_le_bytes(guard.mmap.as_slice()[start..start + 8].try_into().unwrap()) as usize;
-                let len = u64::from_le_bytes(guard.mmap.as_slice()[start + 8..start + 16].try_into().unwrap()) as usize;
-                if len == 0 {
-                    guard.write_free_slot(i, Some((rec.offset as usize, rec.len as usize)))?;
-                    guard.free_extents.push((rec.offset as usize, rec.len as usize, i));
-                    break;
-                }
-            }
-            // if free-list full, we leave the blob for later GC
+            // record freed data extent into persistent free-list (if space), coalescing with neighbors
+            guard.insert_free_extent(rec.offset as usize, rec.len as usize)?;
             return Ok(data);
         }
         Ok(None)
@@ -288,30 +332,68 @@ impl Inner {
 
         // load index (use immutable borrow for reads)
         self.next_data_offset = self.data_start;
-        let buf = self.mmap.as_slice();
-        for i in 0..self.index_capacity {
-            let start = HEADER_SIZE + i * RECORD_SIZE;
-            let rec = IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]);
-            if rec.flags != 0 {
-                // valid
-                self.lru.put(rec.key, i);
-                let end = rec.offset as usize + rec.len as usize;
-                if end > self.next_data_offset {
-                    self.next_data_offset = end;
+        // read-only pass in its own scope so we can do mutations after
+        let mut clear_index_slots: Vec<(usize, IndexRecord)> = Vec::new();
+        let mut clear_free_slots: Vec<usize> = Vec::new();
+        {
+            let buf = self.mmap.as_slice();
+            for i in 0..self.index_capacity {
+                let start = HEADER_SIZE + i * RECORD_SIZE;
+                let rec = IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]);
+                if rec.flags != 0 {
+                    // verify offsets and lengths are sane
+                    let off = rec.offset as usize;
+                    let len = rec.len as usize;
+                    if let Some(end) = off.checked_add(len) {
+                        if end <= buf.len() {
+                            self.lru.put(rec.key, i);
+                            if end > self.next_data_offset {
+                                self.next_data_offset = end;
+                            }
+                        } else {
+                            // mark clear
+                            clear_index_slots.push((i, rec));
+                        }
+                    } else {
+                        // overflow: mark clear
+                        clear_index_slots.push((i, rec));
+                    }
+                } else {
+                    // empty
+                    self.free_slots.push(i);
                 }
-            } else {
-                self.free_slots.push(i);
+            }
+
+            // load free-list entries (immutable borrow)
+            for i in 0..self.free_capacity {
+                let start = self.freelist_start + i * FREE_ENTRY_SIZE;
+                let off = u64::from_le_bytes(buf[start..start + 8].try_into().unwrap()) as usize;
+                let len = u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
+                if len != 0 {
+                    if let Some(end) = off.checked_add(len) {
+                        if end <= buf.len() {
+                            self.free_extents.push((off, len, i));
+                        } else {
+                            // mark clear
+                            clear_free_slots.push(i);
+                        }
+                    } else {
+                        // overflow: mark clear
+                        clear_free_slots.push(i);
+                    }
+                }
             }
         }
 
-        // load free-list entries (immutable borrow)
-        for i in 0..self.free_capacity {
-            let start = self.freelist_start + i * FREE_ENTRY_SIZE;
-            let off = u64::from_le_bytes(buf[start..start + 8].try_into().unwrap()) as usize;
-            let len = u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
-            if len != 0 {
-                self.free_extents.push((off, len, i));
-            }
+        // perform clears collected
+        for (i, mut rec) in clear_index_slots {
+            rec.flags = 0;
+            self.write_index_slot(i, rec)?;
+            self.free_slots.push(i);
+        }
+
+        for i in clear_free_slots {
+            self.write_free_slot(i, None)?;
         }
 
         Ok(())
@@ -324,6 +406,34 @@ impl Inner {
         let mut tmp = [0u8; RECORD_SIZE];
         tmp.copy_from_slice(&buf[start..start + RECORD_SIZE]);
         Ok(IndexRecord::from_bytes(&tmp))
+    }
+
+    /// Read an index slot and validate it; if corrupt, clear it and return a zeroed record.
+    fn get_valid_index_slot(&mut self, slot: usize) -> Result<IndexRecord, io::Error> {
+        let rec = self.read_index_slot(slot)?;
+        if rec.flags != 0 {
+            let offset = rec.offset as usize;
+            let len = rec.len as usize;
+            // validate range
+            if let Some(end) = offset.checked_add(len) {
+                if end > self.mmap.len() {
+                    // corrupt: clear slot
+                    let mut inv = rec;
+                    inv.flags = 0;
+                    self.write_index_slot(slot, inv)?;
+                    self.free_slots.push(slot);
+                    return Ok(inv);
+                }
+            } else {
+                // overflow
+                let mut inv = rec;
+                inv.flags = 0;
+                self.write_index_slot(slot, inv)?;
+                self.free_slots.push(slot);
+                return Ok(inv);
+            }
+        }
+        Ok(rec)
     }
 
     fn write_index_slot(&mut self, slot: usize, rec: IndexRecord) -> Result<(), io::Error> {
@@ -353,6 +463,82 @@ impl Inner {
         Ok(())
     }
 
+    /// Insert a free extent and coalesce with adjacent free extents if present.
+    fn insert_free_extent(&mut self, mut off: usize, mut len: usize) -> Result<(), io::Error> {
+        // Merge adjacent extents robustly and coalesce persistent slots.
+        // We'll repeatedly look for extents adjacent to [off, off+len) and merge them.
+        loop {
+            let mut merged_index: Option<usize> = None;
+            for idx in 0..self.free_extents.len() {
+                let (e_off, e_len, e_slot) = self.free_extents[idx];
+                // previous adjacent
+                if let Some(sum) = e_off.checked_add(e_len) {
+                    if sum == off {
+                        // merge into existing extent
+                        let new_off = e_off;
+                        let new_len = match e_len.checked_add(len) { Some(v) => v, None => continue };
+                        self.free_extents[idx].0 = new_off;
+                        self.free_extents[idx].1 = new_len;
+                        // persist merge
+                        if e_slot != usize::MAX {
+                            self.write_free_slot(e_slot, Some((new_off, new_len)))?;
+                        }
+                        off = new_off;
+                        len = new_len;
+                        merged_index = Some(idx);
+                        break;
+                    }
+                }
+                // next adjacent
+                if let Some(sum) = off.checked_add(len) {
+                    if sum == e_off {
+                        let new_off = off;
+                        let new_len = match len.checked_add(e_len) { Some(v) => v, None => continue };
+                        self.free_extents[idx].0 = new_off;
+                        self.free_extents[idx].1 = new_len;
+                        if e_slot != usize::MAX {
+                            self.write_free_slot(e_slot, Some((new_off, new_len)))?;
+                        }
+                        off = new_off;
+                        len = new_len;
+                        merged_index = Some(idx);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(idx) = merged_index {
+                // After merging we should also look for any other extent that now overlaps and fold it in
+                // We'll continue the loop which will find more adjacent extents.
+                continue;
+            }
+            break;
+        }
+
+        // If exact match already exists in free_extents, we're done
+        for &(_o, _l, _slot) in &self.free_extents {
+            if _o == off && _l == len {
+                return Ok(());
+            }
+        }
+
+        // Try to persist into free-list
+        let buf = self.mmap.as_mut_slice();
+        for i in 0..self.free_capacity {
+            let start = self.freelist_start + i * FREE_ENTRY_SIZE;
+            let len_existing = u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
+            if len_existing == 0 {
+                self.write_free_slot(i, Some((off, len)))?;
+                self.free_extents.push((off, len, i));
+                return Ok(());
+            }
+        }
+
+        // no persistent slot available: store in-memory
+        self.free_extents.push((off, len, usize::MAX));
+        Ok(())
+    }
+
     /// Compact data area by moving live blobs to a contiguous region starting at data_start.
     fn collect_garbage(&mut self) -> Result<(), io::Error> {
         // Build a list of live entries and capture their data into temporaries
@@ -360,30 +546,50 @@ impl Inner {
         let buf = self.mmap.as_slice();
         let mut live = Vec::new(); // (index_slot, IndexRecord, data)
         for i in 0..self.index_capacity {
-            let start = HEADER_SIZE + i * RECORD_SIZE;
-            let rec = IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]);
+            let rec = match self.get_valid_index_slot(i) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             if rec.flags != 0 {
+                let buf = self.mmap.as_slice();
                 let old_off = rec.offset as usize;
                 let len = rec.len as usize;
-                let data = buf[old_off..old_off + len].to_vec();
+                let end = old_off.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)"))?;
+                if end > buf.len() {
+                    // invalid entry, clear
+                    let mut inv = rec;
+                    inv.flags = 0;
+                    self.write_index_slot(i, inv)?;
+                    continue;
+                }
+                let data = buf[old_off..end].to_vec();
                 live.push((i, rec, data));
             }
         }
 
         // Now write all live data sequentially into the data area and update index
         {
-            let buf_mut = self.mmap.as_mut_slice();
             for (i, mut rec, data) in live.into_iter() {
                 let len = data.len();
                 let dst = next;
-                buf_mut[dst..dst + len].copy_from_slice(&data);
+                let end = dst.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "collect_garbage would overflow"))?;
+                // check current length (immutable borrow) and grow if needed
+                let cur_len = self.mmap.as_slice().len();
+                if end > cur_len {
+                    let grow_to = (cur_len.max(end) + 4095) & !4095usize;
+                    self.mmap.resize(grow_to)?;
+                }
+                // safe to reborrow mutable slice now
+                let mut buf_mut = self.mmap.as_mut_slice();
+                buf_mut[dst..end].copy_from_slice(&data);
                 rec.offset = dst as u64;
                 // write updated index bytes
                 rec.to_bytes(&mut buf_mut[HEADER_SIZE + i * RECORD_SIZE..HEADER_SIZE + i * RECORD_SIZE + RECORD_SIZE]);
-                next += len;
+                next = end;
             }
 
             // zero free-list
+            let mut buf_mut = self.mmap.as_mut_slice();
             for i in 0..self.free_capacity {
                 let start = self.freelist_start + i * FREE_ENTRY_SIZE;
                 for b in &mut buf_mut[start..start + FREE_ENTRY_SIZE] {

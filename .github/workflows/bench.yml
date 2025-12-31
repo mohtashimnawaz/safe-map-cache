@@ -30,3 +30,19 @@ jobs:
         with:
           name: criterion-results
           path: target/criterion
+      - name: Run property tests and fuzz-like harness
+        run: |
+          cargo test --test fuzz_like -- --nocapture
+          cargo test --test proptest_ops -- --nocapture
+      - name: Commit benchmark artifacts to bench-results branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone --depth=1 https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }} repo && cd repo
+          mkdir -p bench-results/$(date +"%Y%m%d_%H%M%S")
+          cp -r ../target/criterion bench-results/$(date +"%Y%m%d_%H%M%S") || true
+          git add bench-results || true
+          git commit -m "Add benchmark results: $GITHUB_RUN_ID" || true
+          git push origin HEAD:bench-results || true
