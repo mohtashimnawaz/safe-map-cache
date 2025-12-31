@@ -22,8 +22,8 @@ pub struct Config {
 }
 
 struct Inner {
-    // mmap backing store (lazy-initialized)
-    mmap: Option<MmapMut>,
+    // mmap backing store
+    mmap: crate::mmap::MmapFile,
     // future: index, free-list, LRU structures
 }
 
@@ -37,19 +37,9 @@ pub struct SafeMmapCache {
 impl SafeMmapCache {
     /// Open or create a cache file according to `cfg`.
     pub fn open(cfg: Config) -> Result<Self, CacheError> {
-        // create and size file
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&cfg.path)?;
+        let mmap = crate::mmap::MmapFile::open(cfg.path, cfg.file_size)?;
 
-        file.set_len(cfg.file_size as u64)?;
-
-        // Safe to create mmap here; we'll store it in inner
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
-
-        let inner = Inner { mmap: Some(mmap) };
+        let inner = Inner { mmap };
 
         Ok(SafeMmapCache {
             inner: Arc::new(RwLock::new(inner)),
@@ -71,9 +61,7 @@ impl SafeMmapCache {
     /// Flush mmap to disk
     pub fn flush(&self) -> Result<(), CacheError> {
         let guard = self.inner.read();
-        if let Some(mmap) = &guard.mmap {
-            mmap.flush()?;
-        }
+        guard.mmap.flush()?;
         Ok(())
     }
 }
