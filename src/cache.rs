@@ -48,13 +48,22 @@ impl SafeMmapCache {
             io::Error::new(io::ErrorKind::InvalidInput, "slot_size * capacity overflow")
         })?;
 
+        if cfg.capacity == 0 {
+            return Err(CacheError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capacity must be > 0",
+            )));
+        }
+
         let mmap = crate::mmap::MmapFile::open(cfg.path, file_size)?;
 
         let free_slots = (0..cfg.capacity).rev().collect();
 
+        let cap_nz = std::num::NonZeroUsize::new(cfg.capacity).unwrap();
+
         let inner = Inner {
             mmap,
-            lru: LruCache::new(cfg.capacity),
+            lru: LruCache::new(cap_nz),
             free_slots,
             slot_size: cfg.slot_size,
         };
@@ -69,7 +78,8 @@ impl SafeMmapCache {
         let mut guard = self.inner.write();
         if let Some(slot_idx) = guard.lru.get(&key).cloned() {
             // slot base offset
-            let base = slot_idx * guard.slot_size;
+            let slot_size = guard.slot_size;
+            let base = slot_idx * slot_size;
             let buf = guard.mmap.as_mut_slice();
             if base + 8 > buf.len() {
                 return Err(CacheError::Io(io::Error::new(
@@ -81,7 +91,7 @@ impl SafeMmapCache {
             if len == 0 {
                 return Ok(None);
             }
-            if base + 8 + len > buf.len() || len > guard.slot_size - 8 {
+            if base + 8 + len > buf.len() || len > slot_size - 8 {
                 return Err(CacheError::Io(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "corrupt slot length",
@@ -116,8 +126,8 @@ impl SafeMmapCache {
             s
         } else {
             // evict least recently used
-            if let Some((old_key, old_slot)) = guard.lru.pop_lru() {
-                // remove old entry and reuse slot
+            if let Some((_old_key, old_slot)) = guard.lru.pop_lru() {
+                // reuse slot
                 old_slot
             } else {
                 return Err(CacheError::InsufficientSpace);
