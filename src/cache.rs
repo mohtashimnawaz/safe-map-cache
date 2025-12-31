@@ -221,4 +221,38 @@ mod tests {
         assert_eq!(r, Some(b"one".to_vec()));
         assert_eq!(cache.get(1).unwrap(), None);
     }
+
+    #[test]
+    fn concurrent_access() {
+        use std::thread;
+
+        let tmp = NamedTempFile::new().expect("temp file");
+        let cfg = Config {
+            path: tmp.path().to_path_buf(),
+            slot_size: 256,
+            capacity: 256,
+        };
+
+        let cache = std::sync::Arc::new(SafeMmapCache::open(cfg).expect("open"));
+
+        let mut handles = Vec::new();
+
+        for t in 0..4u64 {
+            let c = cache.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..50u64 {
+                    let key = t * 1000 + i;
+                    let val = format!("v{}_{}", t, i);
+                    c.put(key, val.as_bytes()).expect("put");
+                    // immediate get should succeed
+                    let got = c.get(key).expect("get");
+                    assert_eq!(got, Some(val.into_bytes()));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread join");
+        }
+    }
 }
