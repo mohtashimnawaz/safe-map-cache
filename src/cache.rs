@@ -169,36 +169,40 @@ impl SafeMmapCache {
 
         // allocate data (try to reuse free extents first)
         let needed = value.len();
-        let mut write_offset = None;
-        for (i, (off, len, slot_idx)) in guard.free_extents.iter_mut().enumerate() {
-            if *len >= needed {
-                write_offset = Some(*off);
-                if *len == needed {
-                    // consume entire free extent slot
-                    guard.write_free_slot(*slot_idx, None)?;
-                    guard.free_extents.swap_remove(i);
-                } else {
-                    // consume from front; adjust extent
-                    *off = *off + needed;
-                    *len = *len - needed;
-                    guard.write_free_slot(*slot_idx, Some((*off, *len)))?;
-                }
-                break;
-            }
-        }
+        // select a free extent without mutably borrowing the vector
+        let chosen = guard
+            .free_extents
+            .iter()
+            .enumerate()
+            .find(|(_i, (_off, len, _slot_idx))| *len >= needed)
+            .map(|(i, (off, len, slot_idx))| (i, *off, *len, *slot_idx));
 
-        if write_offset.is_none() {
+        let write_offset = if let Some((i, off, len, slot_idx)) = chosen {
+            // adjust or remove the chosen extent
+            if len == needed {
+                // consume entire free extent slot
+                // swap_remove to avoid shifting
+                guard.free_extents.swap_remove(i);
+                guard.write_free_slot(slot_idx, None)?;
+            } else {
+                // consume from front; adjust extent
+                guard.free_extents[i].0 = off + needed;
+                guard.free_extents[i].1 = len - needed;
+                guard.write_free_slot(slot_idx, Some((off + needed, len - needed)))?;
+            }
+            off
+        } else {
+            // append at end
             let mut offset = guard.next_data_offset;
             if offset + needed > guard.mmap.len() {
                 // grow file
                 let grow_to = (guard.mmap.len().max(offset + needed) + 4095) & !4095usize;
                 guard.mmap.resize(grow_to)?;
             }
-            write_offset = Some(offset);
             guard.next_data_offset = offset + needed;
-        }
+            offset
+        };
 
-        let write_offset = write_offset.unwrap();
         // write data
         let buf = guard.mmap.as_mut_slice();
         buf[write_offset..write_offset + needed].copy_from_slice(value);
@@ -226,15 +230,13 @@ impl SafeMmapCache {
             guard.free_slots.push(slot);
 
             // record freed data extent into persistent free-list (if space)
-            let mut placed = false;
             for i in 0..guard.free_capacity {
                 let start = guard.freelist_start + i * FREE_ENTRY_SIZE;
-                let off = u64::from_le_bytes(guard.mmap.as_slice()[start..start + 8].try_into().unwrap()) as usize;
+                let _off = u64::from_le_bytes(guard.mmap.as_slice()[start..start + 8].try_into().unwrap()) as usize;
                 let len = u64::from_le_bytes(guard.mmap.as_slice()[start + 8..start + 16].try_into().unwrap()) as usize;
                 if len == 0 {
                     guard.write_free_slot(i, Some((rec.offset as usize, rec.len as usize)))?;
                     guard.free_extents.push((rec.offset as usize, rec.len as usize, i));
-                    placed = true;
                     break;
                 }
             }
@@ -353,41 +355,43 @@ impl Inner {
 
     /// Compact data area by moving live blobs to a contiguous region starting at data_start.
     fn collect_garbage(&mut self) -> Result<(), io::Error> {
-        // build new data area into a temporary vector then write back to mmap in-place
+        // Build a list of live entries and capture their data into temporaries
         let mut next = self.data_start;
-        let mut buf = self.mmap.as_mut_slice();
-        // create a temporary vector of (slot, IndexRecord) for live entries
-        let mut live = Vec::new();
+        let buf = self.mmap.as_slice();
+        let mut live = Vec::new(); // (index_slot, IndexRecord, data)
         for i in 0..self.index_capacity {
             let start = HEADER_SIZE + i * RECORD_SIZE;
             let rec = IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]);
             if rec.flags != 0 {
-                live.push((i, rec));
+                let old_off = rec.offset as usize;
+                let len = rec.len as usize;
+                let data = buf[old_off..old_off + len].to_vec();
+                live.push((i, rec, data));
             }
         }
 
-        // move data
-        for (i, mut rec) in live.into_iter() {
-            let old_off = rec.offset as usize;
-            let len = rec.len as usize;
-            // move bytes
-            let dst = next;
-            // use copy to handle overlapping safely
-            let tmp = buf[old_off..old_off + len].to_vec();
-            buf[dst..dst + len].copy_from_slice(&tmp);
-            rec.offset = dst as u64;
-            // write updated index
-            rec.to_bytes(&mut buf[HEADER_SIZE + i * RECORD_SIZE..HEADER_SIZE + i * RECORD_SIZE + RECORD_SIZE]);
-            next += len;
-        }
+        // Now write all live data sequentially into the data area and update index
+        {
+            let buf_mut = self.mmap.as_mut_slice();
+            for (i, mut rec, data) in live.into_iter() {
+                let len = data.len();
+                let dst = next;
+                buf_mut[dst..dst + len].copy_from_slice(&data);
+                rec.offset = dst as u64;
+                // write updated index bytes
+                rec.to_bytes(&mut buf_mut[HEADER_SIZE + i * RECORD_SIZE..HEADER_SIZE + i * RECORD_SIZE + RECORD_SIZE]);
+                next += len;
+            }
 
-        // zero free-list and index-free entries will be set elsewhere
-        for i in 0..self.free_capacity {
-            let start = self.freelist_start + i * FREE_ENTRY_SIZE;
-            for b in &mut buf[start..start + FREE_ENTRY_SIZE] {
-                *b = 0;
+            // zero free-list
+            for i in 0..self.free_capacity {
+                let start = self.freelist_start + i * FREE_ENTRY_SIZE;
+                for b in &mut buf_mut[start..start + FREE_ENTRY_SIZE] {
+                    *b = 0;
+                }
             }
         }
+
         self.free_extents.clear();
         self.next_data_offset = next;
         self.mmap.flush()?;
@@ -406,6 +410,7 @@ mod tests {
         let cfg = Config {
             path: tmp.path().to_path_buf(),
             index_capacity: 16,
+            free_capacity: 16,
             initial_file_size: 16 * 1024,
         };
 
@@ -419,6 +424,7 @@ mod tests {
         let cfg = Config {
             path: tmp.path().to_path_buf(),
             index_capacity: 2,
+            free_capacity: 4,
             initial_file_size: 4096,
         };
 
