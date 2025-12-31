@@ -1,0 +1,32 @@
+name: Weekly Benchmarks
+
+on:
+  schedule:
+    - cron: '0 3 * * 0' # every Sunday at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run benchmarks
+        run: |
+          cargo bench --bench bench_cache -- --quiet
+      - name: Upload criterion results
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: target/criterion
