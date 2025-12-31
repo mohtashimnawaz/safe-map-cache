@@ -1,6 +1,6 @@
 use proptest::prelude::*;
-use std::collections::HashMap;
 use safe_map_cache::{Config, SafeMmapCache};
+use std::collections::HashMap;
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone)]

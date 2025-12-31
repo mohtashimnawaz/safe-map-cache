@@ -12,7 +12,7 @@ use memmap2::{MmapMut, MmapOptions};
 /// - The `File` object is kept alive as long as the mapping exists, satisfying
 ///   the requirement that the file backing the mapping remains valid.
 pub struct MmapFile {
-    path: PathBuf,
+    _path: PathBuf,
     file: File,
     mmap: Option<MmapMut>,
     len: usize,
@@ -21,13 +21,23 @@ pub struct MmapFile {
 impl MmapFile {
     /// Open (creating if needed) a file and map it with at least `len` bytes.
     pub fn open(path: PathBuf, len: usize) -> Result<Self, io::Error> {
-        let file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
         file.set_len(len as u64)?;
         // SAFETY: mapping is safe because `file` is newly opened and will be kept
         // alive inside the returned `MmapFile` for the lifetime of the mapping.
         let mmap = Some(unsafe { MmapOptions::new().map_mut(&file)? });
 
-        Ok(MmapFile { path, file, mmap, len })
+        Ok(MmapFile {
+            _path: path,
+            file,
+            mmap,
+            len,
+        })
     }
 
     /// Get an immutable view of the mapping.

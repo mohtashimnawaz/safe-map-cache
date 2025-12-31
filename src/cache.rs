@@ -44,10 +44,15 @@ impl IndexRecord {
         let offset = u64::from_le_bytes(b[8..16].try_into().unwrap());
         let len = u64::from_le_bytes(b[16..24].try_into().unwrap());
         let flags = u64::from_le_bytes(b[24..32].try_into().unwrap());
-        IndexRecord { key, offset, len, flags }
+        IndexRecord {
+            key,
+            offset,
+            len,
+            flags,
+        }
     }
 
-    fn to_bytes(&self, b: &mut [u8]) {
+    fn to_bytes(self, b: &mut [u8]) {
         b[0..8].copy_from_slice(&self.key.to_le_bytes());
         b[8..16].copy_from_slice(&self.offset.to_le_bytes());
         b[16..24].copy_from_slice(&self.len.to_le_bytes());
@@ -81,7 +86,8 @@ pub struct SafeMmapCache {
 impl SafeMmapCache {
     /// Open or create a cache file according to `cfg`.
     pub fn open(cfg: Config) -> Result<Self, CacheError> {
-        let meta_region = HEADER_SIZE + RECORD_SIZE * cfg.index_capacity + FREE_ENTRY_SIZE * cfg.free_capacity;
+        let meta_region =
+            HEADER_SIZE + RECORD_SIZE * cfg.index_capacity + FREE_ENTRY_SIZE * cfg.free_capacity;
         let initial = cfg.initial_file_size.max(meta_region + 1024);
         let mmap = crate::mmap::MmapFile::open(cfg.path, initial)?;
 
@@ -93,7 +99,9 @@ impl SafeMmapCache {
             index_capacity: cfg.index_capacity,
             free_capacity: cfg.free_capacity,
             freelist_start: HEADER_SIZE + cfg.index_capacity * RECORD_SIZE,
-            data_start: HEADER_SIZE + cfg.index_capacity * RECORD_SIZE + cfg.free_capacity * FREE_ENTRY_SIZE,
+            data_start: HEADER_SIZE
+                + cfg.index_capacity * RECORD_SIZE
+                + cfg.free_capacity * FREE_ENTRY_SIZE,
             next_data_offset: 0,
         };
 
@@ -117,7 +125,12 @@ impl SafeMmapCache {
             let offset = rec.offset as usize;
             let len = rec.len as usize;
             let buf = guard.mmap.as_mut_slice();
-            let end = offset.checked_add(len).ok_or_else(|| CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)")))?;
+            let end = offset.checked_add(len).ok_or_else(|| {
+                CacheError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "corrupt data (overflow)",
+                ))
+            })?;
             if end > buf.len() {
                 // treat as not found after repair
                 return Ok(None);
@@ -136,7 +149,12 @@ impl SafeMmapCache {
             let rec = guard.get_valid_index_slot(slot)?;
             if rec.flags != 0 && (value.len() as u64) <= rec.len {
                 let offset = rec.offset as usize;
-                let end = offset.checked_add(value.len()).ok_or_else(|| CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)")))?;
+                let end = offset.checked_add(value.len()).ok_or_else(|| {
+                    CacheError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "corrupt data (overflow)",
+                    ))
+                })?;
                 let buf = guard.mmap.as_mut_slice();
                 if end > buf.len() {
                     // corrupt slot; clear and fall through to allocate
@@ -185,7 +203,13 @@ impl SafeMmapCache {
             .free_extents
             .iter()
             .enumerate()
-            .filter_map(|(i, (off, len, slot_idx))| if *len >= needed { Some((i, *off, *len, *slot_idx)) } else { None })
+            .filter_map(|(i, (off, len, slot_idx))| {
+                if *len >= needed {
+                    Some((i, *off, *len, *slot_idx))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         // check each candidate for overlap with live records (we have mutable access to guard)
@@ -199,9 +223,19 @@ impl SafeMmapCache {
                 };
                 if rec.flags != 0 {
                     let a0 = rec.offset as usize;
-                    let a1 = match a0.checked_add(rec.len as usize) { Some(v) => v, None => { continue; }};
+                    let a1 = match a0.checked_add(rec.len as usize) {
+                        Some(v) => v,
+                        None => {
+                            continue;
+                        }
+                    };
                     let b0 = off;
-                    let b1 = match off.checked_add(len) { Some(v) => v, None => { continue; }};
+                    let b1 = match off.checked_add(len) {
+                        Some(v) => v,
+                        None => {
+                            continue;
+                        }
+                    };
                     if a0 < b1 && b0 < a1 {
                         overlap = true;
                         break;
@@ -234,7 +268,7 @@ impl SafeMmapCache {
             off
         } else {
             // append at end
-            let mut offset = guard.next_data_offset;
+            let offset = guard.next_data_offset;
             if offset + needed > guard.mmap.len() {
                 // grow file
                 let grow_to = (guard.mmap.len().max(offset + needed) + 4095) & !4095usize;
@@ -248,7 +282,12 @@ impl SafeMmapCache {
         let buf = guard.mmap.as_mut_slice();
         buf[write_offset..write_offset + needed].copy_from_slice(value);
 
-        let new_rec = IndexRecord { key, offset: write_offset as u64, len: needed as u64, flags: 1 };
+        let new_rec = IndexRecord {
+            key,
+            offset: write_offset as u64,
+            len: needed as u64,
+            flags: 1,
+        };
         guard.write_index_slot(slot, new_rec)?;
         guard.lru.put(key, slot);
 
@@ -260,11 +299,18 @@ impl SafeMmapCache {
         let mut guard = self.inner.write();
         if let Some(slot) = guard.lru.pop(&key) {
             let rec = guard.get_valid_index_slot(slot)?;
-            let data = if rec.flags == 0 { None } else {
+            let data = if rec.flags == 0 {
+                None
+            } else {
                 let buf = guard.mmap.as_mut_slice();
                 let offset = rec.offset as usize;
                 let len = rec.len as usize;
-                let end = offset.checked_add(len).ok_or_else(|| CacheError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)")))?;
+                let end = offset.checked_add(len).ok_or_else(|| {
+                    CacheError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "corrupt data (overflow)",
+                    ))
+                })?;
                 if end > buf.len() {
                     // already cleaned by get_valid_index_slot, but be defensive
                     return Ok(None);
@@ -312,7 +358,10 @@ impl Inner {
         {
             let buf = self.mmap.as_mut_slice();
             if buf.len() < HEADER_SIZE {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "file too small"));
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "file too small",
+                ));
             }
             if &buf[0..8] != HEADER_MAGIC {
                 // initialize header
@@ -368,7 +417,8 @@ impl Inner {
             for i in 0..self.free_capacity {
                 let start = self.freelist_start + i * FREE_ENTRY_SIZE;
                 let off = u64::from_le_bytes(buf[start..start + 8].try_into().unwrap()) as usize;
-                let len = u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
+                let len =
+                    u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
                 if len != 0 {
                     if let Some(end) = off.checked_add(len) {
                         if end <= buf.len() {
@@ -445,7 +495,11 @@ impl Inner {
         Ok(())
     }
 
-    fn write_free_slot(&mut self, free_slot: usize, val: Option<(usize, usize)>) -> Result<(), io::Error> {
+    fn write_free_slot(
+        &mut self,
+        free_slot: usize,
+        val: Option<(usize, usize)>,
+    ) -> Result<(), io::Error> {
         let buf = self.mmap.as_mut_slice();
         let start = self.freelist_start + free_slot * FREE_ENTRY_SIZE;
         match val {
@@ -472,42 +526,44 @@ impl Inner {
             for idx in 0..self.free_extents.len() {
                 let (e_off, e_len, e_slot) = self.free_extents[idx];
                 // previous adjacent
-                if let Some(sum) = e_off.checked_add(e_len) {
-                    if sum == off {
-                        // merge into existing extent
-                        let new_off = e_off;
-                        let new_len = match e_len.checked_add(len) { Some(v) => v, None => continue };
-                        self.free_extents[idx].0 = new_off;
-                        self.free_extents[idx].1 = new_len;
-                        // persist merge
-                        if e_slot != usize::MAX {
-                            self.write_free_slot(e_slot, Some((new_off, new_len)))?;
-                        }
-                        off = new_off;
-                        len = new_len;
-                        merged_index = Some(idx);
-                        break;
+                if e_off.checked_add(e_len) == Some(off) {
+                    // merge into existing extent
+                    let new_off = e_off;
+                    let new_len = match e_len.checked_add(len) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    self.free_extents[idx].0 = new_off;
+                    self.free_extents[idx].1 = new_len;
+                    // persist merge
+                    if e_slot != usize::MAX {
+                        self.write_free_slot(e_slot, Some((new_off, new_len)))?;
                     }
+                    off = new_off;
+                    len = new_len;
+                    merged_index = Some(idx);
+                    break;
                 }
                 // next adjacent
-                if let Some(sum) = off.checked_add(len) {
-                    if sum == e_off {
-                        let new_off = off;
-                        let new_len = match len.checked_add(e_len) { Some(v) => v, None => continue };
-                        self.free_extents[idx].0 = new_off;
-                        self.free_extents[idx].1 = new_len;
-                        if e_slot != usize::MAX {
-                            self.write_free_slot(e_slot, Some((new_off, new_len)))?;
-                        }
-                        off = new_off;
-                        len = new_len;
-                        merged_index = Some(idx);
-                        break;
+                if off.checked_add(len) == Some(e_off) {
+                    let new_off = off;
+                    let new_len = match len.checked_add(e_len) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    self.free_extents[idx].0 = new_off;
+                    self.free_extents[idx].1 = new_len;
+                    if e_slot != usize::MAX {
+                        self.write_free_slot(e_slot, Some((new_off, new_len)))?;
                     }
+                    off = new_off;
+                    len = new_len;
+                    merged_index = Some(idx);
+                    break;
                 }
             }
 
-            if let Some(idx) = merged_index {
+            if let Some(_idx) = merged_index {
                 // After merging we should also look for any other extent that now overlaps and fold it in
                 // We'll continue the loop which will find more adjacent extents.
                 continue;
@@ -526,7 +582,8 @@ impl Inner {
         let buf = self.mmap.as_mut_slice();
         for i in 0..self.free_capacity {
             let start = self.freelist_start + i * FREE_ENTRY_SIZE;
-            let len_existing = u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
+            let len_existing =
+                u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
             if len_existing == 0 {
                 self.write_free_slot(i, Some((off, len)))?;
                 self.free_extents.push((off, len, i));
@@ -543,7 +600,6 @@ impl Inner {
     fn collect_garbage(&mut self) -> Result<(), io::Error> {
         // Build a list of live entries and capture their data into temporaries
         let mut next = self.data_start;
-        let buf = self.mmap.as_slice();
         let mut live = Vec::new(); // (index_slot, IndexRecord, data)
         for i in 0..self.index_capacity {
             let rec = match self.get_valid_index_slot(i) {
@@ -554,7 +610,9 @@ impl Inner {
                 let buf = self.mmap.as_slice();
                 let old_off = rec.offset as usize;
                 let len = rec.len as usize;
-                let end = old_off.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)"))?;
+                let end = old_off.checked_add(len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "corrupt data (overflow)")
+                })?;
                 if end > buf.len() {
                     // invalid entry, clear
                     let mut inv = rec;
@@ -572,7 +630,12 @@ impl Inner {
             for (i, mut rec, data) in live.into_iter() {
                 let len = data.len();
                 let dst = next;
-                let end = dst.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "collect_garbage would overflow"))?;
+                let end = dst.checked_add(len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "collect_garbage would overflow",
+                    )
+                })?;
                 // check current length (immutable borrow) and grow if needed
                 let cur_len = self.mmap.as_slice().len();
                 if end > cur_len {
@@ -580,16 +643,19 @@ impl Inner {
                     self.mmap.resize(grow_to)?;
                 }
                 // safe to reborrow mutable slice now
-                let mut buf_mut = self.mmap.as_mut_slice();
+                let buf_mut = self.mmap.as_mut_slice();
                 buf_mut[dst..end].copy_from_slice(&data);
                 rec.offset = dst as u64;
                 // write updated index bytes
-                rec.to_bytes(&mut buf_mut[HEADER_SIZE + i * RECORD_SIZE..HEADER_SIZE + i * RECORD_SIZE + RECORD_SIZE]);
+                rec.to_bytes(
+                    &mut buf_mut[HEADER_SIZE + i * RECORD_SIZE
+                        ..HEADER_SIZE + i * RECORD_SIZE + RECORD_SIZE],
+                );
                 next = end;
             }
 
             // zero free-list
-            let mut buf_mut = self.mmap.as_mut_slice();
+            let buf_mut = self.mmap.as_mut_slice();
             for i in 0..self.free_capacity {
                 let start = self.freelist_start + i * FREE_ENTRY_SIZE;
                 for b in &mut buf_mut[start..start + FREE_ENTRY_SIZE] {
