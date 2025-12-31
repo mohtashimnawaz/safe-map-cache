@@ -3,10 +3,18 @@ use std::{fs::File, fs::OpenOptions, io, path::PathBuf};
 use memmap2::{MmapMut, MmapOptions};
 
 /// A small safe wrapper around a file-backed mutable mmap.
+///
+/// SAFETY:
+/// - `MmapOptions::map_mut` is `unsafe` because it creates a memory mapping of a
+///   file into the process address space. The mapping becomes invalid if the
+///   underlying file is truncated while the mapping exists. This wrapper ensures
+///   the mapping is dropped (unmapped) before the file is resized.
+/// - The `File` object is kept alive as long as the mapping exists, satisfying
+///   the requirement that the file backing the mapping remains valid.
 pub struct MmapFile {
     path: PathBuf,
     file: File,
-    mmap: MmapMut,
+    mmap: Option<MmapMut>,
     len: usize,
 }
 
@@ -15,19 +23,23 @@ impl MmapFile {
     pub fn open(path: PathBuf, len: usize) -> Result<Self, io::Error> {
         let file = OpenOptions::new().read(true).write(true).create(true).open(&path)?;
         file.set_len(len as u64)?;
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        // SAFETY: mapping is safe because `file` is newly opened and will be kept
+        // alive inside the returned `MmapFile` for the lifetime of the mapping.
+        let mmap = Some(unsafe { MmapOptions::new().map_mut(&file)? });
 
         Ok(MmapFile { path, file, mmap, len })
     }
 
     /// Get a mutable view of the mapping.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.mmap[..]
+        &mut self.mmap.as_mut().expect("mapping present")[..]
     }
 
     /// Flush the mapping to disk.
     pub fn flush(&self) -> Result<(), io::Error> {
-        self.mmap.flush()?;
+        if let Some(m) = &self.mmap {
+            m.flush()?;
+        }
         Ok(())
     }
 
@@ -36,10 +48,13 @@ impl MmapFile {
         if new_len == self.len {
             return Ok(());
         }
-        // Dropping mmap before changing file size ensures remap works across platforms.
-        drop(&self.mmap);
+        // Drop (unmap) current mapping before changing file size.
+        if let Some(old) = self.mmap.take() {
+            drop(old);
+        }
         self.file.set_len(new_len as u64)?;
-        self.mmap = unsafe { MmapOptions::new().map_mut(&self.file)? };
+        // SAFETY: remap after file has been resized and ensured to be stable.
+        self.mmap = Some(unsafe { MmapOptions::new().map_mut(&self.file)? });
         self.len = new_len;
         Ok(())
     }

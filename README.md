@@ -31,6 +31,12 @@ Notes & limitations
 - Index is in-memory only. The on-disk format stores raw slot blobs; the in-memory index is rebuilt on fresh open (future work: persistent index).
 - This crate is an educational example and not yet optimized for production workloads.
 
+Safety
+------
+- Mmap creation uses `memmap2`'s `MmapOptions::map_mut`, which is `unsafe` because it creates a mapping of a file into memory. This crate keeps the backing `File` alive for the lifetime of the mapping and always unmaps (drops) the mapping before changing the file size (see `src/mmap.rs`).
+- Invariants to preserve: do not truncate or replace the underlying file while a mapping exists; call `resize` to safely change mapping size; avoid mutating the file backing the mapping from other processes without coordinating.
+- All uses of `unsafe` are confined to `src/mmap.rs` and explained with a `SAFETY` doc comment.
+
 Contributing
 ------------
 PRs and issues welcome. Consider adding variable-size allocation, persistent index, benchmarks and more thorough tests.
