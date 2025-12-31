@@ -1,6 +1,5 @@
-use std::{fs::OpenOptions, io, path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 
-use memmap2::{MmapMut, MmapOptions};
 use parking_lot::RwLock;
 use thiserror::Error;
 

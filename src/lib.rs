@@ -4,5 +4,6 @@
 //! as a cache. Implementation is a work in progress.
 
 pub mod cache;
+mod mmap;
 
 pub use cache::{CacheError, Config, SafeMmapCache};
