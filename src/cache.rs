@@ -5,8 +5,9 @@ use parking_lot::RwLock;
 use thiserror::Error;
 
 const HEADER_MAGIC: &[u8; 8] = b"SMAPCACH";
-const HEADER_SIZE: usize = 16; // magic (8) + version (4) + capacity (4)
+const HEADER_SIZE: usize = 16; // magic (8) + version (4) + index_capacity (4)
 const RECORD_SIZE: usize = 32; // key(8) offset(8) len(8) flags(8)
+const FREE_ENTRY_SIZE: usize = 16; // offset(8) len(8)
 
 #[derive(Error, Debug)]
 pub enum CacheError {
@@ -23,6 +24,8 @@ pub struct Config {
     pub path: PathBuf,
     /// number of index entries
     pub index_capacity: usize,
+    /// number of free-list entries to persist
+    pub free_capacity: usize,
     /// initial file size in bytes
     pub initial_file_size: usize,
 }
@@ -56,7 +59,11 @@ struct Inner {
     mmap: crate::mmap::MmapFile,
     lru: LruCache<u64, usize>, // key -> index_slot
     free_slots: Vec<usize>,
+    // free_extents: (offset, len, freelist_slot)
+    free_extents: Vec<(usize, usize, usize)>,
     index_capacity: usize,
+    free_capacity: usize,
+    freelist_start: usize,
     data_start: usize,
     next_data_offset: usize,
 }
@@ -74,19 +81,23 @@ pub struct SafeMmapCache {
 impl SafeMmapCache {
     /// Open or create a cache file according to `cfg`.
     pub fn open(cfg: Config) -> Result<Self, CacheError> {
-        let initial = cfg.initial_file_size.max(HEADER_SIZE + RECORD_SIZE * cfg.index_capacity + 1024);
+        let meta_region = HEADER_SIZE + RECORD_SIZE * cfg.index_capacity + FREE_ENTRY_SIZE * cfg.free_capacity;
+        let initial = cfg.initial_file_size.max(meta_region + 1024);
         let mmap = crate::mmap::MmapFile::open(cfg.path, initial)?;
 
         let mut inner = Inner {
             mmap,
             lru: LruCache::new(std::num::NonZeroUsize::new(cfg.index_capacity).unwrap()),
             free_slots: Vec::new(),
+            free_extents: Vec::new(),
             index_capacity: cfg.index_capacity,
-            data_start: HEADER_SIZE + cfg.index_capacity * RECORD_SIZE,
+            free_capacity: cfg.free_capacity,
+            freelist_start: HEADER_SIZE + cfg.index_capacity * RECORD_SIZE,
+            data_start: HEADER_SIZE + cfg.index_capacity * RECORD_SIZE + cfg.free_capacity * FREE_ENTRY_SIZE,
             next_data_offset: 0,
         };
 
-        // initialize header if needed and read index
+        // initialize header if needed and read index and free-list
         inner.init_and_load_index()?;
 
         Ok(SafeMmapCache {
@@ -156,19 +167,41 @@ impl SafeMmapCache {
             old_slot
         };
 
-        // allocate data at end
+        // allocate data (try to reuse free extents first)
         let needed = value.len();
-        let mut offset = guard.next_data_offset;
-        if offset + needed > guard.mmap.len() {
-            // grow file
-            let grow_to = (guard.mmap.len().max(offset + needed) + 4095) & !4095usize;
-            guard.mmap.resize(grow_to)?;
+        let mut write_offset = None;
+        for (i, (off, len, slot_idx)) in guard.free_extents.iter_mut().enumerate() {
+            if *len >= needed {
+                write_offset = Some(*off);
+                if *len == needed {
+                    // consume entire free extent slot
+                    guard.write_free_slot(*slot_idx, None)?;
+                    guard.free_extents.swap_remove(i);
+                } else {
+                    // consume from front; adjust extent
+                    *off = *off + needed;
+                    *len = *len - needed;
+                    guard.write_free_slot(*slot_idx, Some((*off, *len)))?;
+                }
+                break;
+            }
         }
+
+        if write_offset.is_none() {
+            let mut offset = guard.next_data_offset;
+            if offset + needed > guard.mmap.len() {
+                // grow file
+                let grow_to = (guard.mmap.len().max(offset + needed) + 4095) & !4095usize;
+                guard.mmap.resize(grow_to)?;
+            }
+            write_offset = Some(offset);
+            guard.next_data_offset = offset + needed;
+        }
+
+        let write_offset = write_offset.unwrap();
         // write data
         let buf = guard.mmap.as_mut_slice();
-        let write_offset = offset;
         buf[write_offset..write_offset + needed].copy_from_slice(value);
-        guard.next_data_offset = write_offset + needed;
 
         let new_rec = IndexRecord { key, offset: write_offset as u64, len: needed as u64, flags: 1 };
         guard.write_index_slot(slot, new_rec)?;
@@ -191,6 +224,21 @@ impl SafeMmapCache {
             inv.flags = 0;
             guard.write_index_slot(slot, inv)?;
             guard.free_slots.push(slot);
+
+            // record freed data extent into persistent free-list (if space)
+            let mut placed = false;
+            for i in 0..guard.free_capacity {
+                let start = guard.freelist_start + i * FREE_ENTRY_SIZE;
+                let off = u64::from_le_bytes(guard.mmap.as_slice()[start..start + 8].try_into().unwrap()) as usize;
+                let len = u64::from_le_bytes(guard.mmap.as_slice()[start + 8..start + 16].try_into().unwrap()) as usize;
+                if len == 0 {
+                    guard.write_free_slot(i, Some((rec.offset as usize, rec.len as usize)))?;
+                    guard.free_extents.push((rec.offset as usize, rec.len as usize, i));
+                    placed = true;
+                    break;
+                }
+            }
+            // if free-list full, we leave the blob for later GC
             return Ok(data);
         }
         Ok(None)
@@ -200,6 +248,13 @@ impl SafeMmapCache {
     pub fn flush(&self) -> Result<(), CacheError> {
         let guard = self.inner.read();
         guard.mmap.flush()?;
+        Ok(())
+    }
+
+    /// Run garbage collection / compaction to reclaim free space.
+    pub fn collect_garbage(&self) -> Result<(), CacheError> {
+        let mut guard = self.inner.write();
+        guard.collect_garbage()?;
         Ok(())
     }
 }
@@ -246,6 +301,17 @@ impl Inner {
                 self.free_slots.push(i);
             }
         }
+
+        // load free-list entries (immutable borrow)
+        for i in 0..self.free_capacity {
+            let start = self.freelist_start + i * FREE_ENTRY_SIZE;
+            let off = u64::from_le_bytes(buf[start..start + 8].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(buf[start + 8..start + 16].try_into().unwrap()) as usize;
+            if len != 0 {
+                self.free_extents.push((off, len, i));
+            }
+        }
+
         Ok(())
     }
 
@@ -263,6 +329,67 @@ impl Inner {
         let start = HEADER_SIZE + slot * RECORD_SIZE;
         rec.to_bytes(&mut buf[start..start + RECORD_SIZE]);
         // flush index area to persist update
+        self.mmap.flush()?;
+        Ok(())
+    }
+
+    fn write_free_slot(&mut self, free_slot: usize, val: Option<(usize, usize)>) -> Result<(), io::Error> {
+        let buf = self.mmap.as_mut_slice();
+        let start = self.freelist_start + free_slot * FREE_ENTRY_SIZE;
+        match val {
+            Some((off, len)) => {
+                buf[start..start + 8].copy_from_slice(&(off as u64).to_le_bytes());
+                buf[start + 8..start + 16].copy_from_slice(&(len as u64).to_le_bytes());
+            }
+            None => {
+                for b in &mut buf[start..start + FREE_ENTRY_SIZE] {
+                    *b = 0;
+                }
+            }
+        }
+        self.mmap.flush()?;
+        Ok(())
+    }
+
+    /// Compact data area by moving live blobs to a contiguous region starting at data_start.
+    fn collect_garbage(&mut self) -> Result<(), io::Error> {
+        // build new data area into a temporary vector then write back to mmap in-place
+        let mut next = self.data_start;
+        let mut buf = self.mmap.as_mut_slice();
+        // create a temporary vector of (slot, IndexRecord) for live entries
+        let mut live = Vec::new();
+        for i in 0..self.index_capacity {
+            let start = HEADER_SIZE + i * RECORD_SIZE;
+            let rec = IndexRecord::from_bytes(&buf[start..start + RECORD_SIZE]);
+            if rec.flags != 0 {
+                live.push((i, rec));
+            }
+        }
+
+        // move data
+        for (i, mut rec) in live.into_iter() {
+            let old_off = rec.offset as usize;
+            let len = rec.len as usize;
+            // move bytes
+            let dst = next;
+            // use copy to handle overlapping safely
+            let tmp = buf[old_off..old_off + len].to_vec();
+            buf[dst..dst + len].copy_from_slice(&tmp);
+            rec.offset = dst as u64;
+            // write updated index
+            rec.to_bytes(&mut buf[HEADER_SIZE + i * RECORD_SIZE..HEADER_SIZE + i * RECORD_SIZE + RECORD_SIZE]);
+            next += len;
+        }
+
+        // zero free-list and index-free entries will be set elsewhere
+        for i in 0..self.free_capacity {
+            let start = self.freelist_start + i * FREE_ENTRY_SIZE;
+            for b in &mut buf[start..start + FREE_ENTRY_SIZE] {
+                *b = 0;
+            }
+        }
+        self.free_extents.clear();
+        self.next_data_offset = next;
         self.mmap.flush()?;
         Ok(())
     }
@@ -327,6 +454,7 @@ mod tests {
         let cfg = Config {
             path: tmp.path().to_path_buf(),
             index_capacity: 256,
+            free_capacity: 256,
             initial_file_size: 256 * 1024,
         };
 
@@ -351,5 +479,35 @@ mod tests {
         for h in handles {
             h.join().expect("thread join");
         }
+    }
+
+    #[test]
+    fn free_list_and_gc() {
+        let tmp = NamedTempFile::new().expect("temp file");
+        let cfg = Config {
+            path: tmp.path().to_path_buf(),
+            index_capacity: 8,
+            free_capacity: 8,
+            initial_file_size: 16 * 1024,
+        };
+
+        let cache = SafeMmapCache::open(cfg).expect("open");
+
+        cache.put(1, b"aaaa").expect("put1");
+        cache.put(2, b"bbbbbbbb").expect("put2");
+        cache.put(3, b"cccc").expect("put3");
+
+        // remove middle
+        cache.remove(2).expect("remove2");
+
+        // put new value that fits into freed slot
+        cache.put(4, b"bbbx").expect("put4");
+        assert_eq!(cache.get(4).unwrap(), Some(b"bbbx".to_vec()));
+
+        // induce GC and ensure data still correct
+        cache.collect_garbage().expect("gc");
+        assert_eq!(cache.get(1).unwrap(), Some(b"aaaa".to_vec()));
+        assert_eq!(cache.get(3).unwrap(), Some(b"cccc".to_vec()));
+        assert_eq!(cache.get(4).unwrap(), Some(b"bbbx".to_vec()));
     }
 }

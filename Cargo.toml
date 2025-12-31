@@ -12,3 +12,4 @@ lru = "0.8"
 [dev-dependencies]
 tempfile = "3.5"
 criterion = "0.5"
+proptest = "1.0"
